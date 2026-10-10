@@ -15,10 +15,11 @@ DEFAULT_MODEL = "jev-latest"
 class JevClient:
     def __init__(self, api_key: Optional[str] = None, base_url: str = DEFAULT_API_URL, model: str = DEFAULT_MODEL):
         self.api_key = api_key or os.getenv("TYPESAFE_API_KEY")
-        if not self.api_key:
-            raise ValueError("Jev API Key is required. Pass in constructor or set TYPESAFE_API_KEY environment variable.")
         self.base_url = base_url
         self.model = model
+
+    def is_available(self) -> bool:
+        return bool(self.api_key)
 
     def evaluate(self, state: str, questions: Dict[str, Any]) -> Dict[str, Any]:
         """

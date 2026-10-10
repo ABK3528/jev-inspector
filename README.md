@@ -91,13 +91,16 @@ playwright install chromium
 ### 2. 导出 Jev 决策模型 API Key（可选）
 > *注：框架内置健壮的本地降级规则引擎。未配置 API Key 时系统会自动切换至本地规则库，核心巡检与报错拦截能力不受影响。*
 ```bash
-export TYPESAFE_API_KEY="your_typesafe_api_key"
+export TYPESAFE_API_KEY=""
 ```
 
 ### 3. 运行单站点智能巡检
 ```bash
 # 启动智能巡检（自动遍历、错误检测、安全防御）
 python3 main.py --url https://httpbin.org/forms/post --max-actions 20
+
+# 运行真实公网站点（Hacker News）端到端巡检 Demo
+python3 demo_real_website.py
 
 # 使用生产配置文件运行并指定飞书告警
 python3 main.py --config inspection_config.sample.json \

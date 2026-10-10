@@ -20,6 +20,8 @@ htmlcov/
 test_*.json
 test_*.html
 report_*.json
+demo_hn_report.json
+demo_hn_report.html
 traversal_report.json
 traversal_report.html
 inspection_dashboard.json
@@ -27,6 +29,7 @@ inspection_history.db
 
 # Playwright & Screenshots
 screenshots/
+demo_screenshots/
 test-results/
 playwright-report/
 

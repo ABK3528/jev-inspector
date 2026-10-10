@@ -290,17 +290,23 @@ class WebInspectionCrawler:
         unique_texts = list(dict.fromkeys(found_texts))
         combined_text = "\n".join(unique_texts)
 
-        try:
-            jev_res = self.jev.judge_error(combined_text)
-        except Exception as e:
-            logger.error(f"Jev judge_error failed: {e}")
-            # Fallback local regex rule
-            is_err = any(kw in combined_text.lower() for kw in ["500", "404", "crash", "error", "失败", "网络错误"])
+        if self.jev.is_available():
+            try:
+                jev_res = self.jev.judge_error(combined_text)
+            except Exception as e:
+                logger.error(f"Jev judge_error failed: {e}")
+                jev_res = None
+        else:
+            jev_res = None
+
+        if not jev_res:
+            # Fallback local regex rule when Jev API is unavailable or offline
+            is_err = any(kw in combined_text.lower() for kw in ["500", "404", "crash", "error", "失败", "网络错误", "internal server error"])
             jev_res = {
                 "is_error": is_err,
                 "error_type": "request_error" if is_err else "normal_info",
-                "confidence": 0.8 if is_err else 0.0,
-                "severity_score": 0.7 if is_err else 0.0
+                "confidence": 0.85 if is_err else 0.0,
+                "severity_score": 0.75 if is_err else 0.0
             }
 
         if jev_res.get("is_error"):
