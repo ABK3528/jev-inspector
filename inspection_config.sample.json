@@ -1,0 +1,47 @@
+{
+  "target_url": "https://the-internet.herokuapp.com/status_codes",
+  "max_actions": 25,
+  "headless": true,
+  "action_timeout_ms": 4000,
+  "page_load_timeout_ms": 20000,
+  "wait_after_action": 0.8,
+  "use_jev_dedup": true,
+  "report_json_path": "traversal_report.json",
+  "report_html_path": "traversal_report.html",
+  "screenshot_dir": "screenshots",
+  "destructive_keywords": [
+    "注销", "登出", "退出登录", "删除账号", "清空数据库", "清空全部",
+    "drop table", "drop database", "format disk", "delete account",
+    "sign out", "logout", "destroy", "purge"
+  ],
+  "auth": {
+    "enabled": false
+  },
+  "flows": [
+    {
+      "name": "关键业务链路冒烟",
+      "start_url": "https://the-internet.herokuapp.com/status_codes",
+      "sla_max_duration_seconds": 10.0,
+      "steps": [
+        {
+          "action": "click",
+          "selector": "a[href='status_codes/200']",
+          "description": "点击 200 状态码链接"
+        },
+        {
+          "action": "assert",
+          "selector": ".example p",
+          "assert_type": "text_contains",
+          "expected": "This page returned a 200 status code",
+          "description": "验证页面成功返回 200 说明"
+        }
+      ]
+    }
+  ],
+  "alert": {
+    "enabled": false,
+    "webhook_url": null,
+    "webhook_type": "generic",
+    "min_severity_score": 0.5
+  }
+}

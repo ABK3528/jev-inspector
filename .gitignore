@@ -1,0 +1,42 @@
+# Bytecode & Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Testing & Reports
+.pytest_cache/
+.coverage
+htmlcov/
+*.prom
+*.db
+test_*.json
+test_*.html
+report_*.json
+traversal_report.json
+traversal_report.html
+inspection_dashboard.json
+inspection_history.db
+
+# Playwright & Screenshots
+screenshots/
+test-results/
+playwright-report/
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+*.log
+dsh-preset-claude-code/

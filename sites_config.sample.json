@@ -1,0 +1,20 @@
+[
+  {
+    "name": "HackerNews",
+    "url": "https://news.ycombinator.com/",
+    "max_actions": 10,
+    "tags": ["tech", "news"]
+  },
+  {
+    "name": "HTTPBin_Forms",
+    "url": "https://httpbin.org/forms/post",
+    "max_actions": 8,
+    "tags": ["api", "test"]
+  },
+  {
+    "name": "Wikipedia",
+    "url": "https://en.wikipedia.org/wiki/Main_Page",
+    "max_actions": 10,
+    "tags": ["reference", "navigation"]
+  }
+]
