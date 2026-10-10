@@ -12,6 +12,12 @@
 > **Jev-Inspector** 是一套专为生产环境打造的**工业级全自主 Web 线上巡检与故障捕获平台**。  
 > 告别手写高脆性 E2E 脚本的沉重负担，系统基于**自适应真实浏览器驱动**与 **TypeSafe Jev 认知决策模型**，实现整站多层级链路遍历、四层智能去重、三级弹性回溯防御与多维（DOM/Console/Network）异常捕获。
 
+<p align="center">
+  <img src="demo_report_preview.png" alt="Jev-Inspector Interactive Dashboard Preview" width="850">
+  <br>
+  <em>▲ Jev-Inspector 自动生成交互式巡检大屏：包含站点拓扑分析、错误证据链（DOM/Console/Network）、双覆盖率指标与耗时分布</em>
+</p>
+
 ---
 
 ## 📌 为什么需要 Jev-Inspector？传统巡检的痛点
