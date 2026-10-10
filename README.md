@@ -66,9 +66,11 @@
 ### 3. 双模驱动：核心业务链 (Flow) + 广度自主探索
 除了自主探索，框架支持通过 `flow_engine.py` 声明核心业务链路（如：打开登录页 → 输入账号密码 → 点击登录 → 验证控制台欢迎语），并支持：
 - 丰富的规则断言：`text_contains`、`visible`、`title_matches`、`url_matches`。
+- **显式多页面/多标签页精准切换 (Multi-Tab Flow)**：支持 `click_and_expect_page`（点击新开页并自动转移上下文）、`open_tab`、`switch_tab` 与 `close_tab`。
 - **SLA 耗时红线**：定义单链路执行时延上限，超时即报 SLA 违约。
 
 ### 4. 专为生产而生的可靠性工程
+- **工业级 Multi-Tab Guardian（防标签页泄漏与焦点迷失）**：在 BrowserContext 层级监听所有弹出的 Popup 和 `target="_blank"` 新标签页，自动进行网络与控制台验活，完成后安全自动关闭，保证内存恒定。
 - **破坏性操作安全防御**：正则安全沙箱实时识别并跳过“退出登录”、“注销账号”、“清空数据”、“Delete”等敏感按钮。
 - **域内锁定与越界自动回跳**：防止爬虫跳出业务域，确保巡检始终在受控边界内。
 - **多通道生产告警**：原生适配飞书交互卡片、钉钉 Markdown 告警、企业微信机器人、Slack Webhook。

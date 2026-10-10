@@ -64,10 +64,14 @@ class FlowDefinition:
 
 
 class FlowExecutor:
-    """Executes a defined user journey flow on a Playwright Page with assertions and timing."""
+    """Executes a defined user journey flow on a Playwright Page/Context with assertions,
+    timing, and multi-page/tab switching support."""
 
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, context: Optional[BrowserContext] = None):
         self.page = page
+        self.context = context or page.context
+        self.named_pages: Dict[str, Page] = {"main": page}
+        self.page_stack: List[Page] = [page]
 
     def execute_flow(self, flow: FlowDefinition) -> Dict[str, Any]:
         start_time = time.time()
@@ -167,6 +171,74 @@ class FlowExecutor:
 
         elif action == "assert":
             self._assert_condition(step)
+
+        # Multi-tab / Page switching actions
+        elif action == "click_and_expect_page":
+            # Click an element (e.g. target="_blank" or window.open) and wait for the new page
+            page_alias = step.value or f"tab_{len(self.named_pages)}"
+            with self.context.expect_page(timeout=step.timeout_ms) as new_page_info:
+                locator = self.page.locator(step.selector).first
+                locator.scroll_into_view_if_needed(timeout=step.timeout_ms)
+                locator.click(timeout=step.timeout_ms)
+            new_page = new_page_info.value
+            new_page.wait_for_load_state("domcontentloaded", timeout=step.timeout_ms)
+            self.named_pages[page_alias] = new_page
+            self.page_stack.append(new_page)
+            self.page = new_page  # Switch current active page to new page
+            logger.info(f"Switched active page to newly opened tab: '{page_alias}' (URL: {new_page.url})")
+
+        elif action == "open_tab":
+            # Explicitly open a new tab with given URL
+            page_alias = step.selector or f"tab_{len(self.named_pages)}"
+            url = step.value
+            new_page = self.context.new_page()
+            if url:
+                new_page.goto(url, wait_until="domcontentloaded", timeout=step.timeout_ms)
+            self.named_pages[page_alias] = new_page
+            self.page_stack.append(new_page)
+            self.page = new_page
+            logger.info(f"Opened new tab: '{page_alias}' (URL: {url})")
+
+        elif action == "switch_tab":
+            # Switch active page to target alias or index
+            target = step.value or "main"
+            if target in self.named_pages:
+                self.page = self.named_pages[target]
+            elif target == "previous" and len(self.page_stack) > 1:
+                self.page_stack.pop()
+                self.page = self.page_stack[-1]
+            elif target.isdigit():
+                idx = int(target)
+                all_pages = self.context.pages
+                if 0 <= idx < len(all_pages):
+                    self.page = all_pages[idx]
+                else:
+                    raise IndexError(f"Page index {idx} out of range (total pages: {len(all_pages)})")
+            else:
+                raise ValueError(f"Unknown page target: '{target}'. Available tabs: {list(self.named_pages.keys())}")
+            self.page.bring_to_front()
+            logger.info(f"Switched active page to tab '{target}' (URL: {self.page.url})")
+
+        elif action == "close_tab":
+            # Close target tab or current active tab
+            target = step.value
+            target_page = self.named_pages.get(target) if target else self.page
+            if target_page:
+                try:
+                    target_page.close()
+                except Exception:
+                    pass
+                # Remove from tracking
+                for k, v in list(self.named_pages.items()):
+                    if v == target_page:
+                        del self.named_pages[k]
+                if target_page in self.page_stack:
+                    self.page_stack.remove(target_page)
+                # Reset active page
+                self.page = self.page_stack[-1] if self.page_stack else (self.context.pages[0] if self.context.pages else None)
+                if self.page:
+                    self.page.bring_to_front()
+                logger.info(f"Closed tab. Active page now set to: {getattr(self.page, 'url', 'None')}")
 
         else:
             raise ValueError(f"Unsupported flow action: '{step.action}'")

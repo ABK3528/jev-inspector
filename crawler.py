@@ -388,10 +388,41 @@ class WebInspectionCrawler:
             # Perform authentication if enabled
             self._setup_authentication(context, page)
 
+            # Industrial Context-level Multi-Tab Guardian:
+            # Listens for any popup or target="_blank" new tabs created during traversal/testing,
+            # health-checks their console/network/dom responses, and safely auto-closes them
+            # to prevent browser memory leaks and focus loss.
+            def _handle_new_popup(new_tab: Page):
+                if new_tab == page:
+                    return
+                try:
+                    logger.info(f"[Multi-Tab Guardian] New window/tab detected: {new_tab}")
+                    new_tab.on("console", lambda msg: self.console_logs.append(f"[{msg.type}][popup] {msg.text}"))
+                    new_tab.on("response", self._on_response)
+                    new_tab.wait_for_load_state("domcontentloaded", timeout=5000)
+                    logger.info(f"[Multi-Tab Guardian] New tab loaded: {new_tab.url}")
+
+                    # Check for errors in the newly opened tab
+                    tab_err = self.check_for_page_errors(new_tab, f"new_tab_popup: {new_tab.url}")
+                    if tab_err:
+                        self.errors_found.append(tab_err)
+
+                    # Safely close popup to preserve main loop focus and prevent memory leaks
+                    new_tab.close()
+                    logger.info(f"[Multi-Tab Guardian] Closed popup tab. Focus preserved on main inspection page.")
+                except Exception as ex:
+                    logger.debug(f"[Multi-Tab Guardian] Popup processing finished: {ex}")
+                    try:
+                        new_tab.close()
+                    except Exception:
+                        pass
+
+            context.on("page", _handle_new_popup)
+
             # Execute user journey flows if defined
             if self.config.flows:
                 logger.info(f"Executing {len(self.config.flows)} predefined user journey flows...")
-                flow_executor = FlowExecutor(page)
+                flow_executor = FlowExecutor(page=page, context=context)
                 for f_data in self.config.flows:
                     flow_def = FlowDefinition.from_dict(f_data)
                     flow_res = flow_executor.execute_flow(flow_def)

@@ -19,6 +19,8 @@ htmlcov/
 *.db
 test_*.json
 test_*.html
+test_multitab_report.json
+test_multitab_report.html
 report_*.json
 demo_hn_report.json
 demo_hn_report.html
