@@ -80,7 +80,7 @@
 
 ### 1. 环境准备与依赖安装
 ```bash
-git clone https://github.com/ABKtester/jev-inspector.git
+git clone https://github.com/ABK3528/jev-inspector.git
 cd jev-inspector
 
 # 安装 Python 依赖与 Playwright 浏览器内核
