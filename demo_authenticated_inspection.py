@@ -36,9 +36,14 @@ def run_authenticated_inspection():
     DEMO_USER = "demo_inspector_user"
     DEMO_PASS = "ValidPassword123"
 
+    # Configure inspection parameters (Authenticated Whole-Site with Archetyping & Coverage Metrics)
     cfg = InspectionConfig(
         target_url="https://quotes.toscrape.com/",
-        max_actions=10,
+        crawl_mode="site",
+        max_pages=6,                  # Protected dashboard page exploration budget
+        max_depth=2,                  # Traverse root and author/tag links while authenticated
+        max_actions_per_page=6,       # Interactive element exploration actions per page
+        max_pages_per_pattern=2,      # Cap per author/tag archetype pattern
         headless=True,
         action_timeout_ms=5000,
         page_load_timeout_ms=25000,
@@ -102,18 +107,25 @@ def run_authenticated_inspection():
     total_skipped = summary.get("total_duplicates_skipped", 0)
     total_errors = summary.get("total_errors_detected", 0)
     duration = summary.get("duration_seconds", 0)
+    coverage = summary.get("coverage_metrics", {})
+    element_cov_rate = coverage.get("element_coverage_rate", 0.0)
+    pages_count = coverage.get("pages_discovered_count", len(report.get("discovered_pages", [])))
+    archetypes_count = coverage.get("url_archetypes_count", len(report.get("url_archetype_distribution", {})))
 
     print("\n" + "=" * 72)
-    print("   📊 Authenticated Inspection Demo Results Summary")
+    print("   📊 Authenticated Inspection Demo Results & Coverage Summary")
     print("=" * 72)
-    print(f"   • Inspection Status:      {status}")
-    print(f"   • Total Actions Executed: {total_actions}")
-    print(f"   • Duplicates Skipped:     {total_skipped} (Structural deduplication active)")
-    print(f"   • Detected Errors:        {total_errors}")
-    print(f"   • Total Duration:         {duration}s")
-    print(f"   • JSON Report:            {cfg.report_json_path}")
-    print(f"   • HTML Report:            {cfg.report_html_path}")
-    print(f"   • Prometheus Metrics:     inspection_metrics.prom")
+    print(f"   • Inspection Status:         {status}")
+    print(f"   • Protected Pages Visited:   {pages_count}")
+    print(f"   • URL Archetype Templates:   {archetypes_count} patterns identified")
+    print(f"   • Authenticated Actions:     {total_actions}")
+    print(f"   • Duplicates Skipped:        {total_skipped} (Structural deduplication active)")
+    print(f"   • Element Coverage Rate:     {element_cov_rate * 100:.2f}%")
+    print(f"   • Detected Errors:           {total_errors}")
+    print(f"   • Total Duration:            {duration}s")
+    print(f"   • JSON Report:               {cfg.report_json_path}")
+    print(f"   • HTML Report:               {cfg.report_html_path}")
+    print(f"   • Prometheus Metrics:        inspection_metrics.prom")
     print("=" * 72)
 
     if total_errors > 0:
