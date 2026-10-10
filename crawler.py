@@ -354,11 +354,11 @@ class WebInspectionCrawler:
                 logger.info(f"Performing automatic login at {auth.login_url}")
                 page.goto(auth.login_url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
                 if auth.username_selector:
-                    page.fill(auth.username_selector, auth.username)
+                    page.locator(auth.username_selector).first.fill(auth.username)
                 if auth.password_selector:
-                    page.fill(auth.password_selector, auth.password)
+                    page.locator(auth.password_selector).first.fill(auth.password)
                 if auth.submit_selector:
-                    page.click(auth.submit_selector)
+                    page.locator(auth.submit_selector).first.click()
                     page.wait_for_timeout(2000)
                 logger.info("Authentication form submitted successfully")
             except Exception as e:

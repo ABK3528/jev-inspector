@@ -102,6 +102,9 @@ python3 main.py --url https://httpbin.org/forms/post --max-actions 20
 # 运行真实公网站点（Hacker News）端到端巡检 Demo
 python3 demo_real_website.py
 
+# 运行需要登录态的真实站点（Quotes To Scrape 受保护用户面板）巡检 Demo
+python3 demo_authenticated_inspection.py
+
 # 使用生产配置文件运行并指定飞书告警
 python3 main.py --config inspection_config.sample.json \
   --webhook-url "https://open.feishu.cn/open-apis/bot/v2/hook/xxx" \

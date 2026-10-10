@@ -22,6 +22,8 @@ test_*.html
 report_*.json
 demo_hn_report.json
 demo_hn_report.html
+demo_auth_report.json
+demo_auth_report.html
 traversal_report.json
 traversal_report.html
 inspection_dashboard.json
@@ -30,6 +32,7 @@ inspection_history.db
 # Playwright & Screenshots
 screenshots/
 demo_screenshots/
+demo_auth_screenshots/
 test-results/
 playwright-report/
 
