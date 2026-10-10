@@ -120,7 +120,7 @@ class TestWholeSiteCrawl(unittest.TestCase):
         
         # Should include home, products, about, contact
         url_paths = [u.replace("http://127.0.0.1:18898", "") for u in discovered_urls]
-        self.assertIn("", url_paths)  # root
+        self.assertTrue("" in url_paths or "/" in url_paths)  # root
         self.assertIn("/products", url_paths)
         self.assertIn("/about", url_paths)
 

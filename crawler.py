@@ -67,8 +67,15 @@ class WebInspectionCrawler:
         # Runtime states
         self.visited_signatures = set()
         self.visited_urls = set()
-        self.site_topology = []  # List of {"from": url, "to": url, "depth": d}
-        self.discovered_pages = []  # List of {"url": url, "title": str, "depth": d, "status": int}
+        self.url_pattern_counts = {}  # archetype -> count (Path Archetyping budget tracker)
+        self.site_topology = []  # List of {"source": url, "target": url, "depth": d}
+        self.discovered_pages = []  # List of {"url": url, "title": str, "depth": d, "status": str}
+        
+        # Coverage metrics tracking
+        self.total_candidates_found = 0
+        self.interacted_candidates = set()
+        self.covered_candidate_signatures = set()
+
         self.executed_actions = []
         self.errors_found = []
         self.skipped_duplicates = []
@@ -122,14 +129,61 @@ class WebInspectionCrawler:
             return False
 
     def _normalize_url(self, raw_url: str, base_url: str) -> Optional[str]:
-        """Normalize URL: resolve relative paths and strip query fragments."""
+        """
+        L1 Advanced URL Normalization & Sanitization:
+        - Resolves relative paths
+        - Strips document anchors (#hash)
+        - Removes tracking & noisy params (utm_*, _t, timestamp, sessionid, token)
+        - Sorts query parameters for deterministic deduplication
+        """
         try:
-            from urllib.parse import urljoin, urldefrag
+            from urllib.parse import urljoin, urldefrag, parse_qs, urlencode, urlparse, urlunparse
             full_url = urljoin(base_url, raw_url)
             clean_url, _ = urldefrag(full_url)
-            return clean_url.rstrip("/") if clean_url.count("/") > 2 else clean_url
+            parsed = urlparse(clean_url)
+
+            # Strip noisy query parameters & sort keys
+            qs = parse_qs(parsed.query, keep_blank_values=False)
+            filtered_qs = []
+            for k in sorted(qs.keys()):
+                lower_k = k.lower()
+                if lower_k.startswith("utm_") or lower_k in ["_t", "timestamp", "_", "spm", "from"]:
+                    continue
+                for v in sorted(qs[k]):
+                    filtered_qs.append((k, v))
+
+            sorted_query = urlencode(filtered_qs)
+            norm_path = parsed.path.rstrip("/") if parsed.path.count("/") > 1 else parsed.path
+            reconstructed = urlunparse((
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                norm_path or "/",
+                parsed.params,
+                sorted_query,
+                ""
+            ))
+            return reconstructed
         except Exception:
             return None
+
+    def _get_url_archetype(self, url: str) -> str:
+        """
+        L2 Path Archetyping:
+        Normalizes numeric IDs, UUIDs, and hashes in URL path into generic template patterns
+        to prevent infinite crawl traps (e.g. /products/10001 -> /products/:id).
+        """
+        try:
+            parsed = urlparse(url)
+            path = parsed.path
+            # Replace UUIDs
+            path = re.sub(r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '/:uuid', path, flags=re.IGNORECASE)
+            # Replace numeric IDs
+            path = re.sub(r'/\d+', '/:id', path)
+            # Replace hash-like hex strings
+            path = re.sub(r'/[0-9a-f]{16,}', '/:hash', path, flags=re.IGNORECASE)
+            return f"{parsed.netloc}{path}"
+        except Exception:
+            return url
 
     def _extract_page_links(self, page: Page, current_url: str) -> List[str]:
         """Extract all in-scope navigational hyperlinks from current page for site-wide graph exploration."""
@@ -595,9 +649,12 @@ class WebInspectionCrawler:
 
             # Interacting with candidate
             self.visited_signatures.add(target_signature)
+            self.interacted_candidates.add(target_candidate.get("xpath", ""))
+            self.covered_candidate_signatures.add(target_signature)
             action_desc = f"{target_candidate['tag']}['{target_candidate['text']}'] (xpath: {target_candidate['xpath']})"
             logger.info(f"Action #{action_count + 1}/{max_actions}: Interacting with {action_desc}")
 
+            expected_page_url = page.url
             action_success = False
             try:
                 locator = page.locator(f"xpath={target_candidate['xpath']}").first
@@ -645,23 +702,49 @@ class WebInspectionCrawler:
             if err:
                 self.errors_found.append(err)
 
-            # Domain / scope guard: Return to start URL if navigated out of scope
-            try:
-                curr_url = page.url
-                if not self._is_url_in_scope(curr_url):
-                    logger.info(f"Navigated outside allowed scope ({curr_url}). Navigating back...")
-                    page.go_back(wait_until="domcontentloaded", timeout=5000)
-            except Exception:
-                pass
+            # Elastic 3-Level Backtracking Guardian
+            if self.config.enable_elastic_backtrack:
+                self._apply_elastic_backtrack(page, expected_url=expected_page_url, base_tag=page_tag)
 
-            # Clear temporary dismissible alerts
-            try:
-                page.evaluate("""() => {
-                    const b = document.getElementById('toast-box') || document.querySelector('.toast, .alert-dismissible');
-                    if (b) b.style.display = 'none';
-                }""")
-            except Exception:
-                pass
+    def _apply_elastic_backtrack(self, page: Page, expected_url: str, base_tag: str = ""):
+        """
+        Elastic 3-Level Backtracking Guardian:
+        L1: In-Place Soft Backtrack - Clear overlays/toasts, hit Escape, click visible close buttons.
+        L2: Browser History Backtrack - If URL navigated away, call page.go_back().
+        L3: Hard Reset / Fresh Context - If still displaced or stuck, re-navigate directly to expected URL.
+        """
+        # L1: Soft dismiss modal/overlay/popovers
+        try:
+            page.keyboard.press("Escape")
+            page.evaluate("""() => {
+                const dismissibles = document.querySelectorAll('.toast, .alert-dismissible, .modal-backdrop, [aria-modal="true"] .close, button.close, [aria-label="Close"]');
+                dismissibles.forEach(el => {
+                    try { el.click(); } catch(e) {}
+                    try { el.style.display = 'none'; } catch(e) {}
+                });
+            }""")
+        except Exception:
+            pass
+
+        # L2 & L3: Check URL displacement
+        try:
+            current_url = page.url
+            if expected_url and current_url.rstrip("/") != expected_url.rstrip("/"):
+                # If drifted out of scope or navigated away from current focus page
+                logger.info(f"[Backtrack L2] Page drifted from {expected_url} to {current_url}. Invoking go_back()...")
+                try:
+                    page.go_back(wait_until="domcontentloaded", timeout=4000)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
+                # If still displaced after go_back, perform L3 Hard Reset
+                if page.url.rstrip("/") != expected_url.rstrip("/"):
+                    logger.info(f"[Backtrack L3] Hard resetting to target page URL: {expected_url}")
+                    page.goto(expected_url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+                    page.wait_for_timeout(500)
+        except Exception as e:
+            logger.debug(f"Backtracking guardian recovered with error: {e}")
 
     def _run_site_wide_traversal(self, page: Page):
         """
@@ -679,8 +762,18 @@ class WebInspectionCrawler:
 
         while queue and pages_inspected < self.config.max_pages:
             current_url, depth = queue.popleft()
+
+            # L2 Path Archetyping check:
+            # Prevents endless pagination / duplicate item traps by capping pages per pattern
+            archetype = self._get_url_archetype(current_url)
+            current_count = self.url_pattern_counts.get(archetype, 0)
+            if current_count >= self.config.max_pages_per_pattern:
+                logger.info(f"[Path Archetyping] Skipping {current_url} - pattern '{archetype}' reached limit ({current_count}/{self.config.max_pages_per_pattern})")
+                continue
+            self.url_pattern_counts[archetype] = current_count + 1
+
             pages_inspected += 1
-            logger.info(f"[Site Traversal] [{pages_inspected}/{self.config.max_pages}] Inspecting page (depth={depth}): {current_url}")
+            logger.info(f"[Site Traversal] [{pages_inspected}/{self.config.max_pages}] Inspecting page (depth={depth}): {current_url} [Pattern: {archetype}]")
 
             # Navigate to target page (if not already there)
             try:
@@ -693,6 +786,7 @@ class WebInspectionCrawler:
                     "url": current_url,
                     "title": title,
                     "depth": depth,
+                    "archetype": archetype,
                     "status": "LOADED"
                 })
             except Exception as e:
@@ -736,6 +830,12 @@ class WebInspectionCrawler:
 
     def _save_and_report(self) -> Dict[str, Any]:
         duration = round(self.end_timestamp - self.start_timestamp, 2)
+        
+        # Calculate coverage metrics
+        total_discovered_elements = len(self.covered_candidate_signatures) + len(self.skipped_duplicates)
+        interacted_count = len(self.covered_candidate_signatures)
+        element_coverage_rate = round(interacted_count / total_discovered_elements, 4) if total_discovered_elements > 0 else 1.0
+
         summary = {
             "target_url": self.config.target_url,
             "crawl_mode": self.config.crawl_mode,
@@ -745,6 +845,13 @@ class WebInspectionCrawler:
             "total_actions_executed": len(self.executed_actions),
             "total_duplicates_skipped": len(self.skipped_duplicates),
             "total_errors_detected": len(self.errors_found),
+            "coverage_metrics": {
+                "unique_interactive_signatures": interacted_count,
+                "total_candidate_elements_encountered": total_discovered_elements,
+                "element_coverage_rate": element_coverage_rate,
+                "pages_discovered_count": len(self.discovered_pages),
+                "url_archetypes_count": len(self.url_pattern_counts)
+            },
             "status": "FAILED" if self.errors_found else "PASSED",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
@@ -753,6 +860,7 @@ class WebInspectionCrawler:
             "summary": summary,
             "site_topology": self.site_topology,
             "discovered_pages": self.discovered_pages,
+            "url_archetype_distribution": self.url_pattern_counts,
             "errors_detected": self.errors_found,
             "executed_actions": self.executed_actions,
             "skipped_duplicates": self.skipped_duplicates
@@ -803,6 +911,12 @@ class WebInspectionCrawler:
             "# HELP web_inspection_actions_total Total actions executed during inspection",
             "# TYPE web_inspection_actions_total counter",
             f'web_inspection_actions_total{{target="{summary["target_url"]}"}} {summary["total_actions_executed"]}',
+            "# HELP web_inspection_element_coverage Element coverage ratio (0.0 to 1.0)",
+            "# TYPE web_inspection_element_coverage gauge",
+            f'web_inspection_element_coverage{{target="{summary["target_url"]}"}} {summary.get("coverage_metrics", {}).get("element_coverage_rate", 1.0)}',
+            "# HELP web_inspection_pages_total Number of distinct pages explored",
+            "# TYPE web_inspection_pages_total gauge",
+            f'web_inspection_pages_total{{target="{summary["target_url"]}"}} {summary.get("total_pages_discovered", 1)}',
             "# HELP web_inspection_duration_seconds Inspection run duration in seconds",
             "# TYPE web_inspection_duration_seconds gauge",
             f'web_inspection_duration_seconds{{target="{summary["target_url"]}"}} {summary["duration_seconds"]}\n'

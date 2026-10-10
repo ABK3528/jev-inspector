@@ -41,12 +41,15 @@ class InspectionConfig:
     max_depth: int = 3        # Maximum link traversal depth from target_url (0 = start page only)
     max_actions_per_page: int = 15  # Actions executed per page in site mode
     max_actions: int = 30     # Maximum total actions (legacy/page mode fallback)
+    max_pages_per_pattern: int = 3  # Max sample pages per URL template archetype (Path Archetyping)
     url_include_patterns: List[str] = field(default_factory=list)  # Regex patterns to allow
     url_exclude_patterns: List[str] = field(default_factory=list)  # Regex patterns to block (e.g. logout, download)
     action_timeout_ms: int = 5000
     page_load_timeout_ms: int = 25000
     wait_after_action: float = 1.0
     headless: bool = True
+    enable_elastic_backtrack: bool = True  # Enable 3-level elastic backtracking (ESC, Close, Hard Reset)
+    min_element_coverage_target: float = 0.70  # Target element coverage ratio (e.g. 70%)
     
     # User Journey Flow Definitions (optional deterministic flows)
     flows: List[Dict[str, Any]] = field(default_factory=list)

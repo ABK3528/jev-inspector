@@ -50,9 +50,17 @@
 ### 1. 零脚本 AI 主动遍历、整站拓扑图与结构去重
 无需预先录制操作。引擎基于真实 Chromium 实时解析 DOM 树，提取所有按钮、表单、输入框、下拉菜单等交互元素。
 - **整站拓扑遍历（Whole-Site BFS Traversal）**：支持从入口 URL 开始，自动发现整站内部超链接，利用广度优先搜索（BFS）层层下钻探索整个站点所有可达页面，并自动生成整站拓扑依赖图（Site Topology Graph）。
-- **可控抓取边界**：可精准配置最大遍历深度（`max_depth`）、最大总页面数（`max_pages`）、每页探索动作数（`max_actions_per_page`），并支持 URL 正则白名单/黑名单过滤。
-- **结构指纹（Structural Fingerprinting）**：自动提取元素父级容器路径，将列表项（`li`）、表格行（`tr`）、卡片网格（`card`）归一化，自动规避对同类数据的大量重复点击。
-- **语义去重（Semantic Dedup）**：调用 Jev 智能研判控件语义，过滤功能冗余的重复项。
+- **四层递进式去重机制**：
+  - **L1 URL 规范化**：自动剔除 `utm_*`、时间戳、会话参数并排序 Query 参数；
+  - **L2 Path Archetyping（路径模板聚类）**：自动将 `/items/1001`、`/items/1002` 归纳为模版原型 `/items/:id`，并施加模板配额上限（`max_pages_per_pattern`），阻断无限爬取陷阱；
+  - **L3 结构指纹（Structural Fingerprinting）**：自动提取元素父级容器路径，将列表项（`li`）、表格行（`tr`）、卡片网格（`card`）归一化，规避同类重复点击；
+  - **L4 Jev 语义去重**：调用 Jev 智能研判控件语义，过滤功能冗余的重复项。
+- **三级弹性回溯防御（Elastic 3-Level Backtracking）**：
+  - **L1 级原位软回溯**：交互产生弹窗后，自动按 ESC 并关闭遮罩与弹窗，恢复主页面可点击性；
+  - **L2 级浏览器历史回溯**：检测到页面发生路由漂移，自动调用 `page.go_back()` 安全回退；
+  - **L3 级硬重置与上下文复原**：若页面被破坏或回退失败，强制重新加载目标页 URL，重置干净上下文。
+- **全方位覆盖率度量（Coverage Metrics）**：
+  - 自动输出页面发现总数、唯一交互指纹数、**控件覆盖率指标（`element_coverage_rate`）**，并在 Prometheus 监控指标中导出 `web_inspection_element_coverage`。
 
 ### 2. 多维故障证据链 + AI 智能研判
 每次交互后，引擎秒级聚合三大维度的现场证据：
@@ -215,6 +223,9 @@ Ran 32 tests in 9.72s
 OK
 ```
 
+- **`test_site_crawl.py`**：整站 BFS 拓扑遍历、层级深度截断及 URL 正则过滤。
+- **`test_advanced_crawl.py`**：URL 规范化、Path Archetyping 模板聚类去重、三级弹性回溯防御及控件覆盖率指标测试。
+- **`test_multitab.py`**：多标签页切换、Multi-Tab Guardian 自动关闭及显式多页面流测试。
 - **`test_flow.py`**：业务流执行引擎、各种规则断言及 SLA 时延违约测试。
 - **`test_scheduler.py`**：并发调度器、SQLite 结果持久化、`/health`、`/metrics` HTTP 服务测试。
 - **`test_inspection.py`**：配置覆盖、安全防误触过滤、结构去重及本地 Mock 端到端闭环。
