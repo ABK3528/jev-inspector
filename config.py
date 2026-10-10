@@ -36,7 +36,13 @@ class InspectionConfig:
     allowed_domains: List[str] = field(default_factory=list)
     
     # Traversal parameters
-    max_actions: int = 30
+    crawl_mode: str = "site"  # "page" (single page exploration) or "site" (whole-site recursive exploration)
+    max_pages: int = 20       # Maximum distinct pages to inspect across whole site
+    max_depth: int = 3        # Maximum link traversal depth from target_url (0 = start page only)
+    max_actions_per_page: int = 15  # Actions executed per page in site mode
+    max_actions: int = 30     # Maximum total actions (legacy/page mode fallback)
+    url_include_patterns: List[str] = field(default_factory=list)  # Regex patterns to allow
+    url_exclude_patterns: List[str] = field(default_factory=list)  # Regex patterns to block (e.g. logout, download)
     action_timeout_ms: int = 5000
     page_load_timeout_ms: int = 25000
     wait_after_action: float = 1.0
@@ -108,6 +114,12 @@ class InspectionConfig:
             self.max_actions = int(os.getenv("INSPECTION_MAX_ACTIONS"))
         if os.getenv("INSPECTION_HEADLESS"):
             self.headless = os.getenv("INSPECTION_HEADLESS").lower() in ("true", "1", "yes")
+        if os.getenv("INSPECTION_CRAWL_MODE"):
+            self.crawl_mode = os.getenv("INSPECTION_CRAWL_MODE")
+        if os.getenv("INSPECTION_MAX_PAGES"):
+            self.max_pages = int(os.getenv("INSPECTION_MAX_PAGES"))
+        if os.getenv("INSPECTION_MAX_DEPTH"):
+            self.max_depth = int(os.getenv("INSPECTION_MAX_DEPTH"))
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

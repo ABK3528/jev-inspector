@@ -17,6 +17,9 @@ def parse_args():
     )
     parser.add_argument("--config", type=str, default=None, help="Path to inspection JSON configuration file")
     parser.add_argument("--url", type=str, default=None, help="Target URL to inspect (overrides config)")
+    parser.add_argument("--crawl-mode", type=str, choices=["site", "page"], default=None, help="Traversal mode: 'site' (whole site) or 'page' (single page)")
+    parser.add_argument("--max-pages", type=int, default=None, help="Max distinct pages to traverse in site mode")
+    parser.add_argument("--max-depth", type=int, default=None, help="Max link traversal depth in site mode")
     parser.add_argument("--api-key", type=str, default=None, help="Jev/TypeSafe API Key (or TYPESAFE_API_KEY env)")
     parser.add_argument("--max-actions", type=int, default=None, help="Maximum traversal actions (e.g. 20)")
     parser.add_argument("--headless", action="store_true", default=None, help="Run browser headless (default: True)")
@@ -41,6 +44,12 @@ def main():
     # 2. CLI arguments override config
     if args.url:
         cfg.target_url = args.url
+    if args.crawl_mode:
+        cfg.crawl_mode = args.crawl_mode
+    if args.max_pages is not None:
+        cfg.max_pages = args.max_pages
+    if args.max_depth is not None:
+        cfg.max_depth = args.max_depth
     if args.api_key:
         cfg.api_key = args.api_key
     if args.max_actions is not None:

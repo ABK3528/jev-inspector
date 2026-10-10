@@ -66,6 +66,9 @@ class WebInspectionCrawler:
 
         # Runtime states
         self.visited_signatures = set()
+        self.visited_urls = set()
+        self.site_topology = []  # List of {"from": url, "to": url, "depth": d}
+        self.discovered_pages = []  # List of {"url": url, "title": str, "depth": d, "status": int}
         self.executed_actions = []
         self.errors_found = []
         self.skipped_duplicates = []
@@ -80,22 +83,79 @@ class WebInspectionCrawler:
         self.end_timestamp = 0.0
 
     def _is_url_in_scope(self, url: str) -> bool:
-        """Check if target URL belongs to allowed domains / root scope."""
+        """Check if target URL belongs to allowed domains / root scope and passes pattern filters."""
         try:
+            if not url or not url.startswith(("http://", "https://")):
+                return False
+
             parsed = urlparse(url)
             start_parsed = urlparse(self.config.target_url)
 
-            # Match start URL host
-            if parsed.netloc == start_parsed.netloc:
-                return True
+            # 1. Host match
+            host_matched = (parsed.netloc == start_parsed.netloc)
+            if not host_matched:
+                for domain in self.config.allowed_domains:
+                    if parsed.netloc == domain or parsed.netloc.endswith("." + domain):
+                        host_matched = True
+                        break
 
-            # Match user-configured allowed domains
-            for domain in self.config.allowed_domains:
-                if parsed.netloc == domain or parsed.netloc.endswith("." + domain):
-                    return True
-            return False
+            if not host_matched:
+                return False
+
+            # 2. Check exclusion patterns
+            for pat in self.config.url_exclude_patterns:
+                if re.search(pat, url, re.IGNORECASE):
+                    return False
+
+            # 3. Check inclusion patterns (if specified)
+            if self.config.url_include_patterns:
+                matched_include = False
+                for pat in self.config.url_include_patterns:
+                    if re.search(pat, url, re.IGNORECASE):
+                        matched_include = True
+                        break
+                if not matched_include:
+                    return False
+
+            return True
         except Exception:
             return False
+
+    def _normalize_url(self, raw_url: str, base_url: str) -> Optional[str]:
+        """Normalize URL: resolve relative paths and strip query fragments."""
+        try:
+            from urllib.parse import urljoin, urldefrag
+            full_url = urljoin(base_url, raw_url)
+            clean_url, _ = urldefrag(full_url)
+            return clean_url.rstrip("/") if clean_url.count("/") > 2 else clean_url
+        except Exception:
+            return None
+
+    def _extract_page_links(self, page: Page, current_url: str) -> List[str]:
+        """Extract all in-scope navigational hyperlinks from current page for site-wide graph exploration."""
+        js_code = """
+        () => {
+            const links = [];
+            document.querySelectorAll('a[href]').forEach(a => {
+                const href = a.getAttribute('href');
+                if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:') && !href.startsWith('#')) {
+                    links.push(href);
+                }
+            });
+            return links;
+        }
+        """
+        try:
+            raw_links = page.evaluate(js_code)
+            valid_links = []
+            for r in raw_links:
+                norm = self._normalize_url(r, current_url)
+                if norm and self._is_url_in_scope(norm):
+                    valid_links.append(norm)
+            return list(dict.fromkeys(valid_links))
+        except Exception as e:
+            logger.debug(f"Failed to extract page links: {e}")
+            return []
 
     def _on_response(self, response: Response):
         """Intercept network responses to catch 4xx/5xx HTTP failures in real time."""
@@ -459,134 +519,13 @@ class WebInspectionCrawler:
             if initial_err:
                 self.errors_found.append(initial_err)
 
-            action_count = 0
-            consecutive_failures = 0
-
-            # Main interactive traversal loop
-            while action_count < self.config.max_actions:
-                if consecutive_failures >= self.config.max_consecutive_failures:
-                    logger.error(f"Reached {self.config.max_consecutive_failures} consecutive failures. Aborting traversal loop.")
-                    break
-
-                elements = self._extract_interactive_elements(page)
-                if not elements:
-                    logger.info("No interactive elements discovered on page.")
-                    break
-
-                target_candidate = None
-                target_signature = None
-
-                for el in elements:
-                    if el.get("disabled"):
-                        continue
-
-                    # Safety Guard: Skip destructive operations
-                    el_text = el.get("text", "")
-                    if self.destructive_pattern and self.destructive_pattern.search(el_text):
-                        logger.info(f"Skipping destructive button/action: '{el_text}'")
-                        continue
-
-                    sig = self._generate_signature(el)
-                    summary = f"Tag: <{el['tag']}>, Text: '{el_text}', Container: '{el.get('containerType')}', Pattern: '{el['pattern']}'"
-
-                    # 1. Structural Fingerprint Check
-                    if sig in self.visited_signatures:
-                        self.skipped_duplicates.append({
-                            "element": summary,
-                            "reason": "Structural fingerprint matches already tested container type",
-                            "signature": sig
-                        })
-                        continue
-
-                    # 2. Jev Semantic Redundancy Check
-                    if self.config.use_jev_dedup and len(self.visited_signatures) > 0 and (len(self.visited_signatures) % 4 == 0):
-                        should_skip = self.jev.should_skip_duplicate(summary, list(self.visited_signatures))
-                        if should_skip:
-                            self.skipped_duplicates.append({
-                                "element": summary,
-                                "reason": "Jev semantic evaluation determined as redundant duplicate data",
-                                "signature": sig
-                            })
-                            self.visited_signatures.add(sig)
-                            continue
-
-                    target_candidate = el
-                    target_signature = sig
-                    break
-
-                if not target_candidate:
-                    logger.info("All interactive element categories explored without redundant repeats.")
-                    break
-
-                # Interacting with candidate
-                self.visited_signatures.add(target_signature)
-                action_desc = f"{target_candidate['tag']}['{target_candidate['text']}'] (xpath: {target_candidate['xpath']})"
-                logger.info(f"Action #{action_count + 1}/{self.config.max_actions}: Interacting with {action_desc}")
-
-                action_success = False
-                try:
-                    locator = page.locator(f"xpath={target_candidate['xpath']}").first
-                    tag = target_candidate['tag']
-                    input_type = target_candidate['type']
-
-                    try:
-                        locator.scroll_into_view_if_needed(timeout=2000)
-                    except Exception:
-                        pass
-
-                    if tag == "input" and input_type in ["text", "password", "email", "search", "number", "tel"]:
-                        locator.fill("inspection_test_input", timeout=self.config.action_timeout_ms)
-                    elif tag == "select":
-                        try:
-                            locator.select_option(index=1, timeout=self.config.action_timeout_ms)
-                        except Exception:
-                            locator.click(timeout=self.config.action_timeout_ms)
-                    else:
-                        locator.click(timeout=self.config.action_timeout_ms)
-
-                    action_success = True
-                    consecutive_failures = 0
-                    self.executed_actions.append({
-                        "step": action_count + 1,
-                        "action": action_desc,
-                        "status": "success",
-                        "signature": target_signature
-                    })
-                except Exception as ex:
-                    consecutive_failures += 1
-                    logger.warning(f"Interaction step failed: {ex}")
-                    self.executed_actions.append({
-                        "step": action_count + 1,
-                        "action": action_desc,
-                        "status": f"failed: {str(ex)}",
-                        "signature": target_signature
-                    })
-
-                action_count += 1
-                time.sleep(self.config.wait_after_action)
-
-                # Check for errors after each action
-                err = self.check_for_page_errors(page, action_desc)
-                if err:
-                    self.errors_found.append(err)
-
-                # Domain / scope guard: Return to start URL if navigated out of scope
-                try:
-                    curr_url = page.url
-                    if not self._is_url_in_scope(curr_url):
-                        logger.info(f"Navigated outside allowed scope ({curr_url}). Navigating back...")
-                        page.go_back(wait_until="domcontentloaded", timeout=5000)
-                except Exception:
-                    pass
-
-                # Clear temporary dismissible alerts
-                try:
-                    page.evaluate("""() => {
-                        const b = document.getElementById('toast-box') || document.querySelector('.toast, .alert-dismissible');
-                        if (b) b.style.display = 'none';
-                    }""")
-                except Exception:
-                    pass
+            # Determine crawl strategy:
+            # - "site": Multi-page BFS site traversal with per-page interactive exploration & topology discovery
+            # - "page": Classic single-page exhaustive interactive traversal
+            if self.config.crawl_mode == "site":
+                self._run_site_wide_traversal(page)
+            else:
+                self._run_single_page_traversal(page, max_actions=self.config.max_actions)
 
             browser.close()
 
@@ -594,11 +533,215 @@ class WebInspectionCrawler:
         result = self._save_and_report()
         return result
 
+    def _run_single_page_traversal(self, page: Page, max_actions: int, page_tag: str = ""):
+        """Run interactive element discovery and execution on a single page context."""
+        action_count = 0
+        consecutive_failures = 0
+
+        while action_count < max_actions:
+            if consecutive_failures >= self.config.max_consecutive_failures:
+                logger.error(f"Reached {self.config.max_consecutive_failures} consecutive failures. Aborting traversal loop.")
+                break
+
+            elements = self._extract_interactive_elements(page)
+            if not elements:
+                logger.info(f"No interactive elements discovered on page {page_tag or page.url}.")
+                break
+
+            target_candidate = None
+            target_signature = None
+
+            for el in elements:
+                if el.get("disabled"):
+                    continue
+
+                # Safety Guard: Skip destructive operations
+                el_text = el.get("text", "")
+                if self.destructive_pattern and self.destructive_pattern.search(el_text):
+                    logger.info(f"Skipping destructive button/action: '{el_text}'")
+                    continue
+
+                sig = self._generate_signature(el)
+                summary = f"Tag: <{el['tag']}>, Text: '{el_text}', Container: '{el.get('containerType')}', Pattern: '{el['pattern']}'"
+
+                # 1. Structural Fingerprint Check
+                if sig in self.visited_signatures:
+                    self.skipped_duplicates.append({
+                        "element": summary,
+                        "reason": "Structural fingerprint matches already tested container type",
+                        "signature": sig
+                    })
+                    continue
+
+                # 2. Jev Semantic Redundancy Check
+                if self.config.use_jev_dedup and len(self.visited_signatures) > 0 and (len(self.visited_signatures) % 4 == 0):
+                    should_skip = self.jev.should_skip_duplicate(summary, list(self.visited_signatures))
+                    if should_skip:
+                        self.skipped_duplicates.append({
+                            "element": summary,
+                            "reason": "Jev semantic evaluation determined as redundant duplicate data",
+                            "signature": sig
+                        })
+                        self.visited_signatures.add(sig)
+                        continue
+
+                target_candidate = el
+                target_signature = sig
+                break
+
+            if not target_candidate:
+                logger.info("All interactive element categories explored without redundant repeats on current page.")
+                break
+
+            # Interacting with candidate
+            self.visited_signatures.add(target_signature)
+            action_desc = f"{target_candidate['tag']}['{target_candidate['text']}'] (xpath: {target_candidate['xpath']})"
+            logger.info(f"Action #{action_count + 1}/{max_actions}: Interacting with {action_desc}")
+
+            action_success = False
+            try:
+                locator = page.locator(f"xpath={target_candidate['xpath']}").first
+                tag = target_candidate['tag']
+                input_type = target_candidate['type']
+
+                try:
+                    locator.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+
+                if tag == "input" and input_type in ["text", "password", "email", "search", "number", "tel"]:
+                    locator.fill("inspection_test_input", timeout=self.config.action_timeout_ms)
+                elif tag == "select":
+                    try:
+                        locator.select_option(index=1, timeout=self.config.action_timeout_ms)
+                    except Exception:
+                        locator.click(timeout=self.config.action_timeout_ms)
+                else:
+                    locator.click(timeout=self.config.action_timeout_ms)
+
+                action_success = True
+                consecutive_failures = 0
+                self.executed_actions.append({
+                    "step": len(self.executed_actions) + 1,
+                    "action": action_desc,
+                    "status": "success",
+                    "signature": target_signature
+                })
+            except Exception as ex:
+                consecutive_failures += 1
+                logger.warning(f"Interaction step failed: {ex}")
+                self.executed_actions.append({
+                    "step": len(self.executed_actions) + 1,
+                    "action": action_desc,
+                    "status": f"failed: {str(ex)}",
+                    "signature": target_signature
+                })
+
+            action_count += 1
+            time.sleep(self.config.wait_after_action)
+
+            # Check for errors after each action
+            err = self.check_for_page_errors(page, action_desc)
+            if err:
+                self.errors_found.append(err)
+
+            # Domain / scope guard: Return to start URL if navigated out of scope
+            try:
+                curr_url = page.url
+                if not self._is_url_in_scope(curr_url):
+                    logger.info(f"Navigated outside allowed scope ({curr_url}). Navigating back...")
+                    page.go_back(wait_until="domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+
+            # Clear temporary dismissible alerts
+            try:
+                page.evaluate("""() => {
+                    const b = document.getElementById('toast-box') || document.querySelector('.toast, .alert-dismissible');
+                    if (b) b.style.display = 'none';
+                }""")
+            except Exception:
+                pass
+
+    def _run_site_wide_traversal(self, page: Page):
+        """
+        Whole-Site Autonomous Traversal:
+        BFS-based crawl queue spanning all reachable pages within max_depth and max_pages.
+        Extracts links, maintains site topology graph, and executes interactive element testing on each page.
+        """
+        from collections import deque
+        norm_start = self._normalize_url(self.config.target_url, self.config.target_url) or self.config.target_url
+        queue = deque([(norm_start, 0)])  # (url, depth)
+        self.visited_urls.add(norm_start)
+
+        pages_inspected = 0
+        logger.info(f"[Site Traversal] Starting whole-site BFS traversal. Max Pages={self.config.max_pages}, Max Depth={self.config.max_depth}")
+
+        while queue and pages_inspected < self.config.max_pages:
+            current_url, depth = queue.popleft()
+            pages_inspected += 1
+            logger.info(f"[Site Traversal] [{pages_inspected}/{self.config.max_pages}] Inspecting page (depth={depth}): {current_url}")
+
+            # Navigate to target page (if not already there)
+            try:
+                if page.url.rstrip("/") != current_url.rstrip("/"):
+                    page.goto(current_url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+                    page.wait_for_timeout(1000)
+                
+                title = page.title()
+                self.discovered_pages.append({
+                    "url": current_url,
+                    "title": title,
+                    "depth": depth,
+                    "status": "LOADED"
+                })
+            except Exception as e:
+                logger.error(f"[Site Traversal] Failed to navigate to {current_url}: {e}")
+                self.errors_found.append({
+                    "action": f"navigate_site_page: {current_url}",
+                    "detected_texts": [str(e)],
+                    "error_type": "network_error",
+                    "jev_confidence": 1.0,
+                    "severity_score": 1.0,
+                    "screenshot": "",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+                continue
+
+            # Check for page load errors
+            p_err = self.check_for_page_errors(page, f"page_load: {current_url}")
+            if p_err:
+                self.errors_found.append(p_err)
+
+            # Discover outgoing links for the crawl graph (if depth allows)
+            if depth < self.config.max_depth:
+                extracted_links = self._extract_page_links(page, current_url)
+                logger.info(f"[Site Traversal] Found {len(extracted_links)} in-scope links on {current_url}")
+
+                for link in extracted_links:
+                    self.site_topology.append({
+                        "source": current_url,
+                        "target": link,
+                        "depth": depth + 1
+                    })
+                    if link not in self.visited_urls:
+                        self.visited_urls.add(link)
+                        queue.append((link, depth + 1))
+
+            # Run interactive exploration on this specific page
+            if self.config.max_actions_per_page > 0:
+                self._run_single_page_traversal(page, max_actions=self.config.max_actions_per_page, page_tag=current_url)
+
+        logger.info(f"[Site Traversal] Completed. Inspected {pages_inspected} pages, discovered {len(self.visited_urls)} unique URLs, {len(self.site_topology)} navigation edges.")
+
     def _save_and_report(self) -> Dict[str, Any]:
         duration = round(self.end_timestamp - self.start_timestamp, 2)
         summary = {
             "target_url": self.config.target_url,
+            "crawl_mode": self.config.crawl_mode,
             "duration_seconds": duration,
+            "total_pages_discovered": len(self.discovered_pages),
+            "total_urls_visited": len(self.visited_urls),
             "total_actions_executed": len(self.executed_actions),
             "total_duplicates_skipped": len(self.skipped_duplicates),
             "total_errors_detected": len(self.errors_found),
@@ -608,6 +751,8 @@ class WebInspectionCrawler:
 
         report = {
             "summary": summary,
+            "site_topology": self.site_topology,
+            "discovered_pages": self.discovered_pages,
             "errors_detected": self.errors_found,
             "executed_actions": self.executed_actions,
             "skipped_duplicates": self.skipped_duplicates

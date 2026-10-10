@@ -21,6 +21,8 @@ test_*.json
 test_*.html
 test_multitab_report.json
 test_multitab_report.html
+test_site_crawl_report.json
+test_site_crawl_report.html
 report_*.json
 demo_hn_report.json
 demo_hn_report.html

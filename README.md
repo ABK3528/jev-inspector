@@ -47,8 +47,10 @@
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1. 零脚本 AI 主动遍历与结构去重
+### 1. 零脚本 AI 主动遍历、整站拓扑图与结构去重
 无需预先录制操作。引擎基于真实 Chromium 实时解析 DOM 树，提取所有按钮、表单、输入框、下拉菜单等交互元素。
+- **整站拓扑遍历（Whole-Site BFS Traversal）**：支持从入口 URL 开始，自动发现整站内部超链接，利用广度优先搜索（BFS）层层下钻探索整个站点所有可达页面，并自动生成整站拓扑依赖图（Site Topology Graph）。
+- **可控抓取边界**：可精准配置最大遍历深度（`max_depth`）、最大总页面数（`max_pages`）、每页探索动作数（`max_actions_per_page`），并支持 URL 正则白名单/黑名单过滤。
 - **结构指纹（Structural Fingerprinting）**：自动提取元素父级容器路径，将列表项（`li`）、表格行（`tr`）、卡片网格（`card`）归一化，自动规避对同类数据的大量重复点击。
 - **语义去重（Semantic Dedup）**：调用 Jev 智能研判控件语义，过滤功能冗余的重复项。
 
@@ -96,10 +98,13 @@ playwright install chromium
 export TYPESAFE_API_KEY=""
 ```
 
-### 3. 运行单站点智能巡检
+### 3. 运行单站点/整站智能巡检
 ```bash
-# 启动智能巡检（自动遍历、错误检测、安全防御）
-python3 main.py --url https://httpbin.org/forms/post --max-actions 20
+# 启动整站递归智能巡检（自动发现整站页面、BFS 下钻、拓扑发现、错误检测、安全防御）
+python3 main.py --url https://httpbin.org/forms/post --crawl-mode site --max-pages 10 --max-depth 2
+
+# 仅巡检指定单个页面
+python3 main.py --url https://httpbin.org/forms/post --crawl-mode page --max-actions 20
 
 # 运行真实公网站点（Hacker News）端到端巡检 Demo
 python3 demo_real_website.py
