@@ -1,0 +1,938 @@
+"""
+Online Web Synthetic Inspection Engine.
+Enhanced enterprise-grade crawler and health inspection tool.
+Features:
+- Config-driven (InspectionConfig) with CLI & environment variable overrides
+- Dual-channel error detection: DOM Toasts/Alerts + Console logs + Network 4xx/5xx responses
+- Playwright-based robust interaction with scroll-into-view, timeout controls and safe navigation recovery
+- Destructive Action Guard: Safely avoids dangerous buttons (delete, format, drop table, logout)
+- Deduplication: Structural fingerprinting + Jev System One semantic dedup
+- Multi-channel notification & alerting (Feishu, DingTalk, WeCom, Slack, Generic Webhook)
+- Prometheus / OpenMetrics metric output for observability
+- Clean exit code semantics for CI/CD / Cron monitoring (0 = healthy, 1 = error/unhealthy)
+"""
+
+import time
+import json
+import re
+import os
+import logging
+from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright, Page, Response, BrowserContext
+
+from ..decision.jev_client import JevClient
+from ..core.config import InspectionConfig
+from ..alert.alert_manager import AlertManager
+from .flow_engine import FlowDefinition, FlowExecutor
+from ..extensions.base import BaseExtension, ExtensionManager
+
+logger = logging.getLogger("inspection.engine")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+)
+
+class WebInspectionCrawler:
+    def __init__(
+        self,
+        config: Optional[InspectionConfig] = None,
+        jev_client: Optional[JevClient] = None
+    ):
+        self.config = config or InspectionConfig()
+        self.config.apply_env_overrides()
+
+        # Initialize Jev Client
+        if jev_client:
+            self.jev = jev_client
+        else:
+            api_key = self.config.api_key or os.getenv("TYPESAFE_API_KEY")
+            self.jev = JevClient(
+                api_key=api_key,
+                base_url=self.config.base_url,
+                model=self.config.model
+            )
+
+        # Destructive patterns regex
+        escaped_keywords = [re.escape(k) for k in self.config.destructive_keywords]
+        self.destructive_pattern = re.compile("|".join(escaped_keywords), re.IGNORECASE) if escaped_keywords else None
+
+        # Alert manager
+        self.alert_manager = AlertManager(
+            webhook_url=self.config.alert.webhook_url,
+            webhook_type=self.config.alert.webhook_type
+        )
+
+        # Extension Manager for Plugin Lifecycle Hooks
+        self.extensions = ExtensionManager()
+
+        os.makedirs(self.config.screenshot_dir, exist_ok=True)
+
+        # Runtime states
+        self.visited_signatures = set()
+        self.visited_urls = set()
+        self.url_pattern_counts = {}  # archetype -> count (Path Archetyping budget tracker)
+        self.site_topology = []  # List of {"source": url, "target": url, "depth": d}
+        self.discovered_pages = []  # List of {"url": url, "title": str, "depth": d, "status": str}
+        
+        # Coverage metrics tracking
+        self.total_candidates_found = 0
+        self.interacted_candidates = set()
+        self.covered_candidate_signatures = set()
+
+        self.executed_actions = []
+        self.errors_found = []
+        self.skipped_duplicates = []
+        self.console_logs = []
+        self.network_errors = []
+        self.page_dialogs = []
+
+        self._last_console_index = 0
+        self._last_dialog_index = 0
+        self._last_network_index = 0
+        self.start_timestamp = 0.0
+        self.end_timestamp = 0.0
+
+    def _is_url_in_scope(self, url: str) -> bool:
+        """Check if target URL belongs to allowed domains / root scope and passes pattern filters."""
+        try:
+            if not url or not url.startswith(("http://", "https://")):
+                return False
+
+            parsed = urlparse(url)
+            start_parsed = urlparse(self.config.target_url)
+
+            # 1. Host match
+            host_matched = (parsed.netloc == start_parsed.netloc)
+            if not host_matched:
+                for domain in self.config.allowed_domains:
+                    if parsed.netloc == domain or parsed.netloc.endswith("." + domain):
+                        host_matched = True
+                        break
+
+            if not host_matched:
+                return False
+
+            # 2. Check exclusion patterns
+            for pat in self.config.url_exclude_patterns:
+                if re.search(pat, url, re.IGNORECASE):
+                    return False
+
+            # 3. Check inclusion patterns (if specified)
+            if self.config.url_include_patterns:
+                matched_include = False
+                for pat in self.config.url_include_patterns:
+                    if re.search(pat, url, re.IGNORECASE):
+                        matched_include = True
+                        break
+                if not matched_include:
+                    return False
+
+            return True
+        except Exception:
+            return False
+
+    def _normalize_url(self, raw_url: str, base_url: str) -> Optional[str]:
+        """
+        L1 Advanced URL Normalization & Sanitization:
+        - Resolves relative paths
+        - Strips document anchors (#hash)
+        - Removes tracking & noisy params (utm_*, _t, timestamp, sessionid, token)
+        - Sorts query parameters for deterministic deduplication
+        """
+        try:
+            from urllib.parse import urljoin, urldefrag, parse_qs, urlencode, urlparse, urlunparse
+            full_url = urljoin(base_url, raw_url)
+            clean_url, _ = urldefrag(full_url)
+            parsed = urlparse(clean_url)
+
+            # Strip noisy query parameters & sort keys
+            qs = parse_qs(parsed.query, keep_blank_values=False)
+            filtered_qs = []
+            for k in sorted(qs.keys()):
+                lower_k = k.lower()
+                if lower_k.startswith("utm_") or lower_k in ["_t", "timestamp", "_", "spm", "from"]:
+                    continue
+                for v in sorted(qs[k]):
+                    filtered_qs.append((k, v))
+
+            sorted_query = urlencode(filtered_qs)
+            norm_path = parsed.path.rstrip("/") if parsed.path.count("/") > 1 else parsed.path
+            reconstructed = urlunparse((
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                norm_path or "/",
+                parsed.params,
+                sorted_query,
+                ""
+            ))
+            return reconstructed
+        except Exception:
+            return None
+
+    def _get_url_archetype(self, url: str) -> str:
+        """
+        L2 Path Archetyping:
+        Normalizes numeric IDs, UUIDs, and hashes in URL path into generic template patterns
+        to prevent infinite crawl traps (e.g. /products/10001 -> /products/:id).
+        """
+        try:
+            parsed = urlparse(url)
+            path = parsed.path
+            # Replace UUIDs
+            path = re.sub(r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '/:uuid', path, flags=re.IGNORECASE)
+            # Replace numeric IDs
+            path = re.sub(r'/\d+', '/:id', path)
+            # Replace hash-like hex strings
+            path = re.sub(r'/[0-9a-f]{16,}', '/:hash', path, flags=re.IGNORECASE)
+            return f"{parsed.netloc}{path}"
+        except Exception:
+            return url
+
+    def _extract_page_links(self, page: Page, current_url: str) -> List[str]:
+        """Extract all in-scope navigational hyperlinks from current page for site-wide graph exploration."""
+        js_code = """
+        () => {
+            const links = [];
+            document.querySelectorAll('a[href]').forEach(a => {
+                const href = a.getAttribute('href');
+                if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:') && !href.startsWith('#')) {
+                    links.push(href);
+                }
+            });
+            return links;
+        }
+        """
+        try:
+            raw_links = page.evaluate(js_code)
+            valid_links = []
+            for r in raw_links:
+                norm = self._normalize_url(r, current_url)
+                if norm and self._is_url_in_scope(norm):
+                    valid_links.append(norm)
+            return list(dict.fromkeys(valid_links))
+        except Exception as e:
+            logger.debug(f"Failed to extract page links: {e}")
+            return []
+
+    def _on_response(self, response: Response):
+        """Intercept network responses to catch 4xx/5xx HTTP failures in real time."""
+        try:
+            status = response.status
+            url = response.url
+            # Ignore static assets like images, fonts, icons
+            if status >= 400 and not url.endswith((".ico", ".svg", ".png", ".jpg", ".jpeg", ".woff2", ".ttf")):
+                self.network_errors.append({
+                    "url": url,
+                    "status": status,
+                    "status_text": response.status_text
+                })
+        except Exception:
+            pass
+
+    def _handle_dialog(self, dialog):
+        msg = f"Dialog: {dialog.message}"
+        self.page_dialogs.append(msg)
+        logger.warning(f"[Browser Dialog] {msg}")
+        try:
+            dialog.accept()
+        except Exception:
+            pass
+
+    def _extract_interactive_elements(self, page: Page) -> List[Dict[str, Any]]:
+        """
+        Extract interactive candidate elements from DOM:
+        Buttons, inputs, selects, textareas, links, tabs, and clickable components.
+        Generates robust XPath, bounding box, semantic role, text label, and container pattern.
+        """
+        js_code = """
+        () => {
+            function getXPath(element) {
+                if (element.id && element.id !== '') return `//*[@id="${element.id}"]`;
+                if (element === document.body) return '/html/body';
+                let ix = 0;
+                let siblings = element.parentNode ? element.parentNode.childNodes : [];
+                for (let i = 0; i < siblings.length; i++) {
+                    let sibling = siblings[i];
+                    if (sibling === element) {
+                        return (element.parentNode ? getXPath(element.parentNode) : '') + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';
+                    }
+                    if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
+                        ix++;
+                    }
+                }
+                return '';
+            }
+
+            function getContainerPattern(el) {
+                let curr = el;
+                let depth = 0;
+                let containerType = 'standalone';
+                let path = [];
+
+                while (curr && curr !== document.body && depth < 8) {
+                    let tag = curr.tagName.toLowerCase();
+                    let cls = curr.className && typeof curr.className === 'string' 
+                        ? curr.className.trim().split(/\\s+/).slice(0, 2).join('.') 
+                        : '';
+                    let identifier = cls ? `${tag}.${cls}` : tag;
+                    path.unshift(identifier);
+
+                    if (['tr', 'li'].includes(tag) || (cls && /(card|item|row|entry|post|list)/i.test(cls))) {
+                        containerType = identifier;
+                    }
+                    curr = curr.parentElement;
+                    depth++;
+                }
+                return {
+                    fullPath: path.join(' > '),
+                    containerType: containerType
+                };
+            }
+
+            const candidates = [];
+            const selector = 'button, a, input, select, textarea, [role="button"], [role="tab"], [role="link"], [role="menuitem"], [onclick]';
+            const nodes = document.querySelectorAll(selector);
+
+            nodes.forEach((el, index) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || rect.width <= 3 || rect.height <= 3) {
+                    return;
+                }
+                const tag = el.tagName.toLowerCase();
+                const type = el.getAttribute('type') || '';
+                const text = (el.innerText || el.textContent || el.value || el.placeholder || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+                const id = el.id || '';
+                const name = el.name || '';
+                const role = el.getAttribute('role') || '';
+                const xpath = getXPath(el);
+                const { fullPath, containerType } = getContainerPattern(el);
+
+                candidates.push({
+                    index,
+                    tag,
+                    type,
+                    text: text.slice(0, 100),
+                    id,
+                    name,
+                    role,
+                    xpath,
+                    pattern: fullPath,
+                    containerType: containerType,
+                    disabled: el.disabled || el.getAttribute('aria-disabled') === 'true'
+                });
+            });
+            return candidates;
+        }
+        """
+        try:
+            return page.evaluate(js_code)
+        except Exception as e:
+            logger.warning(f"Failed to extract DOM elements: {e}")
+            return []
+
+    def _generate_signature(self, el_info: Dict[str, Any]) -> str:
+        """Generate structural and semantic fingerprint for duplicate detection."""
+        pattern = el_info.get("pattern", "")
+        tag = el_info.get("tag", "")
+        role = el_info.get("role", "")
+        text = el_info.get("text", "")
+        el_id = el_info.get("id", "")
+        container_type = el_info.get("containerType", "standalone")
+
+        if container_type != "standalone" or any(s in pattern for s in ["table", "tbody", "tr", "ul > li", "ol > li", "card", "grid"]):
+            norm_pattern = re.sub(r'\[\d+\]', '', pattern)
+            return f"repeated_container|{tag}|role:{role}|container:{container_type}|path:{norm_pattern}"
+
+        if el_id:
+            return f"single|{tag}|id:{el_id}"
+        return f"single|{tag}|text:{text[:24]}|pattern:{pattern}"
+
+    def check_for_page_errors(self, page: Page, action_desc: str) -> Optional[Dict[str, Any]]:
+        """
+        Gathers evidence across DOM alerts, Toasts, Console logs, and Network 4xx/5xx responses.
+        Submits structured prompt to Jev System One Model for typed classification.
+        Captures screenshot if an error is verified.
+        """
+        error_extract_js = """
+        () => {
+            const potentialErrorEls = document.querySelectorAll(
+                '.toast, .message, .alert, .notification, .error, .danger, .warning, [role="alert"], [class*="error"], [class*="alert"]'
+            );
+            const messages = [];
+            potentialErrorEls.forEach(el => {
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                    return;
+                }
+                const text = (el.innerText || el.textContent || '').trim();
+                if (text && text.length > 2 && text.length < 350) {
+                    messages.push(text);
+                }
+            });
+            return messages;
+        }
+        """
+        found_texts = []
+        try:
+            dom_messages = page.evaluate(error_extract_js)
+            found_texts.extend(dom_messages)
+        except Exception:
+            pass
+
+        # 2. Console error logs
+        recent_console = self.console_logs[self._last_console_index:]
+        self._last_console_index = len(self.console_logs)
+        for c in recent_console:
+            lower_c = c.lower()
+            if any(kw in lower_c for kw in ["error", "fail", "500", "400", "403", "404", "网络错误", "系统开小差", "错误请求"]):
+                found_texts.append(f"Console: {c}")
+
+        # 3. Network 4xx / 5xx responses
+        recent_network = self.network_errors[self._last_network_index:]
+        self._last_network_index = len(self.network_errors)
+        for n in recent_network:
+            found_texts.append(f"HTTP {n['status']} {n['status_text']} on {n['url']}")
+
+        # 4. Browser dialog messages
+        recent_dialogs = self.page_dialogs[self._last_dialog_index:]
+        self._last_dialog_index = len(self.page_dialogs)
+        for d in recent_dialogs:
+            found_texts.append(f"Dialog: {d}")
+
+        if not found_texts:
+            return None
+
+        # Deduplicate evidence
+        unique_texts = list(dict.fromkeys(found_texts))
+        combined_text = "\n".join(unique_texts)
+
+        if self.jev.is_available():
+            try:
+                jev_res = self.jev.judge_error(combined_text)
+            except Exception as e:
+                logger.error(f"Jev judge_error failed: {e}")
+                jev_res = None
+        else:
+            jev_res = None
+
+        if not jev_res:
+            # Fallback local regex rule when Jev API is unavailable or offline
+            is_err = any(kw in combined_text.lower() for kw in ["500", "404", "crash", "error", "失败", "网络错误", "internal server error"])
+            jev_res = {
+                "is_error": is_err,
+                "error_type": "request_error" if is_err else "normal_info",
+                "confidence": 0.85 if is_err else 0.0,
+                "severity_score": 0.75 if is_err else 0.0
+            }
+
+        if jev_res.get("is_error"):
+            screenshot_path = ""
+            try:
+                fname = f"error_{int(time.time() * 1000)}.png"
+                full_path = os.path.join(self.config.screenshot_dir, fname)
+                page.screenshot(path=full_path, full_page=False)
+                screenshot_path = full_path
+            except Exception:
+                pass
+
+            error_record = {
+                "action": action_desc,
+                "detected_texts": unique_texts,
+                "error_type": jev_res.get("error_type"),
+                "jev_confidence": jev_res.get("confidence", 0.0),
+                "severity_score": jev_res.get("severity_score", 0.0),
+                "screenshot": screenshot_path,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            logger.warning(
+                f"[!] DETECTED ERROR: {error_record['error_type']} "
+                f"(severity: {error_record['severity_score']:.2f}, conf: {error_record['jev_confidence']:.2f}) "
+                f"at action: {action_desc}"
+            )
+            return error_record
+
+        return None
+
+    def _setup_authentication(self, context: BrowserContext, page: Page):
+        """Perform automated login or inject cookies/session if configured."""
+        auth = self.config.auth
+        if not auth.enabled:
+            return
+
+        # Inject cookies
+        if auth.cookies:
+            context.add_cookies(auth.cookies)
+            logger.info(f"Injected {len(auth.cookies)} session cookies")
+
+        # Form-based login
+        if auth.login_url and auth.username and auth.password:
+            try:
+                logger.info(f"Performing automatic login at {auth.login_url}")
+                page.goto(auth.login_url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+                if auth.username_selector:
+                    page.locator(auth.username_selector).first.fill(auth.username)
+                if auth.password_selector:
+                    page.locator(auth.password_selector).first.fill(auth.password)
+                if auth.submit_selector:
+                    page.locator(auth.submit_selector).first.click()
+                    page.wait_for_timeout(2000)
+                logger.info("Authentication form submitted successfully")
+            except Exception as e:
+                logger.error(f"Authentication flow encountered error: {e}")
+
+    def run(self) -> Dict[str, Any]:
+        """
+        Main execution loop for synthetic inspection.
+        Returns complete inspection result dictionary.
+        """
+        self.start_timestamp = time.time()
+        logger.info(f"Starting Web Synthetic Inspection on: {self.config.target_url}")
+        logger.info(f"Headless: {self.config.headless} | Max Actions: {self.config.max_actions}")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self.config.headless)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 (InspectionBot/1.0)"
+            )
+            page = context.new_page()
+
+            page.on("console", lambda msg: self.console_logs.append(f"[{msg.type}] {msg.text}"))
+            page.on("dialog", lambda dialog: self._handle_dialog(dialog))
+            page.on("response", self._on_response)
+
+            # Perform authentication if enabled
+            self._setup_authentication(context, page)
+
+            # Industrial Context-level Multi-Tab Guardian:
+            # Listens for any popup or target="_blank" new tabs created during traversal/testing,
+            # health-checks their console/network/dom responses, and safely auto-closes them
+            # to prevent browser memory leaks and focus loss.
+            def _handle_new_popup(new_tab: Page):
+                if new_tab == page:
+                    return
+                try:
+                    logger.info(f"[Multi-Tab Guardian] New window/tab detected: {new_tab}")
+                    new_tab.on("console", lambda msg: self.console_logs.append(f"[{msg.type}][popup] {msg.text}"))
+                    new_tab.on("response", self._on_response)
+                    new_tab.wait_for_load_state("domcontentloaded", timeout=5000)
+                    logger.info(f"[Multi-Tab Guardian] New tab loaded: {new_tab.url}")
+
+                    # Check for errors in the newly opened tab
+                    tab_err = self.check_for_page_errors(new_tab, f"new_tab_popup: {new_tab.url}")
+                    if tab_err:
+                        self.errors_found.append(tab_err)
+
+                    # Safely close popup to preserve main loop focus and prevent memory leaks
+                    new_tab.close()
+                    logger.info(f"[Multi-Tab Guardian] Closed popup tab. Focus preserved on main inspection page.")
+                except Exception as ex:
+                    logger.debug(f"[Multi-Tab Guardian] Popup processing finished: {ex}")
+                    try:
+                        new_tab.close()
+                    except Exception:
+                        pass
+
+            context.on("page", _handle_new_popup)
+
+            # Execute user journey flows if defined
+            if self.config.flows:
+                logger.info(f"Executing {len(self.config.flows)} predefined user journey flows...")
+                flow_executor = FlowExecutor(page=page, context=context)
+                for f_data in self.config.flows:
+                    flow_def = FlowDefinition.from_dict(f_data)
+                    flow_res = flow_executor.execute_flow(flow_def)
+                    if flow_res.get("status") != "PASSED":
+                        for err in flow_res.get("errors", []):
+                            self.errors_found.append({
+                                "action": f"Flow '{flow_def.name}'",
+                                "detected_texts": [err.get("error", "")],
+                                "error_type": "flow_assertion_failure",
+                                "jev_confidence": 1.0,
+                                "severity_score": 0.9,
+                                "screenshot": "",
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                            })
+
+            # Load target page
+            try:
+                page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+                page.wait_for_timeout(1500)
+            except Exception as e:
+                logger.error(f"Initial page load failed: {e}")
+                self.errors_found.append({
+                    "action": "initial_page_load",
+                    "detected_texts": [str(e)],
+                    "error_type": "network_error",
+                    "jev_confidence": 1.0,
+                    "severity_score": 1.0,
+                    "screenshot": "",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+
+            # Check for initial page errors
+            initial_err = self.check_for_page_errors(page, "initial_page_load")
+            if initial_err:
+                self.errors_found.append(initial_err)
+
+            # Determine crawl strategy:
+            # - "site": Multi-page BFS site traversal with per-page interactive exploration & topology discovery
+            # - "page": Classic single-page exhaustive interactive traversal
+            if self.config.crawl_mode == "site":
+                self._run_site_wide_traversal(page)
+            else:
+                self._run_single_page_traversal(page, max_actions=self.config.max_actions)
+
+            browser.close()
+
+        self.end_timestamp = time.time()
+        result = self._save_and_report()
+        return result
+
+    def _run_single_page_traversal(self, page: Page, max_actions: int, page_tag: str = ""):
+        """Run interactive element discovery and execution on a single page context."""
+        action_count = 0
+        consecutive_failures = 0
+
+        while action_count < max_actions:
+            if consecutive_failures >= self.config.max_consecutive_failures:
+                logger.error(f"Reached {self.config.max_consecutive_failures} consecutive failures. Aborting traversal loop.")
+                break
+
+            elements = self._extract_interactive_elements(page)
+            if not elements:
+                logger.info(f"No interactive elements discovered on page {page_tag or page.url}.")
+                break
+
+            target_candidate = None
+            target_signature = None
+
+            for el in elements:
+                if el.get("disabled"):
+                    continue
+
+                # Safety Guard: Skip destructive operations
+                el_text = el.get("text", "")
+                if self.destructive_pattern and self.destructive_pattern.search(el_text):
+                    logger.info(f"Skipping destructive button/action: '{el_text}'")
+                    continue
+
+                sig = self._generate_signature(el)
+                summary = f"Tag: <{el['tag']}>, Text: '{el_text}', Container: '{el.get('containerType')}', Pattern: '{el['pattern']}'"
+
+                # 1. Structural Fingerprint Check
+                if sig in self.visited_signatures:
+                    self.skipped_duplicates.append({
+                        "element": summary,
+                        "reason": "Structural fingerprint matches already tested container type",
+                        "signature": sig
+                    })
+                    continue
+
+                # 2. Jev Semantic Redundancy Check
+                if self.config.use_jev_dedup and len(self.visited_signatures) > 0 and (len(self.visited_signatures) % 4 == 0):
+                    should_skip = self.jev.should_skip_duplicate(summary, list(self.visited_signatures))
+                    if should_skip:
+                        self.skipped_duplicates.append({
+                            "element": summary,
+                            "reason": "Jev semantic evaluation determined as redundant duplicate data",
+                            "signature": sig
+                        })
+                        self.visited_signatures.add(sig)
+                        continue
+
+                target_candidate = el
+                target_signature = sig
+                break
+
+            if not target_candidate:
+                logger.info("All interactive element categories explored without redundant repeats on current page.")
+                break
+
+            # Interacting with candidate
+            self.visited_signatures.add(target_signature)
+            self.interacted_candidates.add(target_candidate.get("xpath", ""))
+            self.covered_candidate_signatures.add(target_signature)
+            action_desc = f"{target_candidate['tag']}['{target_candidate['text']}'] (xpath: {target_candidate['xpath']})"
+            logger.info(f"Action #{action_count + 1}/{max_actions}: Interacting with {action_desc}")
+
+            expected_page_url = page.url
+            action_success = False
+            try:
+                locator = page.locator(f"xpath={target_candidate['xpath']}").first
+                tag = target_candidate['tag']
+                input_type = target_candidate['type']
+
+                try:
+                    locator.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+
+                if tag == "input" and input_type in ["text", "password", "email", "search", "number", "tel"]:
+                    locator.fill("inspection_test_input", timeout=self.config.action_timeout_ms)
+                elif tag == "select":
+                    try:
+                        locator.select_option(index=1, timeout=self.config.action_timeout_ms)
+                    except Exception:
+                        locator.click(timeout=self.config.action_timeout_ms)
+                else:
+                    locator.click(timeout=self.config.action_timeout_ms)
+
+                action_success = True
+                consecutive_failures = 0
+                self.executed_actions.append({
+                    "step": len(self.executed_actions) + 1,
+                    "action": action_desc,
+                    "status": "success",
+                    "signature": target_signature
+                })
+            except Exception as ex:
+                consecutive_failures += 1
+                logger.warning(f"Interaction step failed: {ex}")
+                self.executed_actions.append({
+                    "step": len(self.executed_actions) + 1,
+                    "action": action_desc,
+                    "status": f"failed: {str(ex)}",
+                    "signature": target_signature
+                })
+
+            action_count += 1
+            time.sleep(self.config.wait_after_action)
+
+            # Check for errors after each action
+            err = self.check_for_page_errors(page, action_desc)
+            if err:
+                self.errors_found.append(err)
+
+            # Elastic 3-Level Backtracking Guardian
+            if self.config.enable_elastic_backtrack:
+                self._apply_elastic_backtrack(page, expected_url=expected_page_url, base_tag=page_tag)
+
+    def _apply_elastic_backtrack(self, page: Page, expected_url: str, base_tag: str = ""):
+        """
+        Elastic 3-Level Backtracking Guardian:
+        L1: In-Place Soft Backtrack - Clear overlays/toasts, hit Escape, click visible close buttons.
+        L2: Browser History Backtrack - If URL navigated away, call page.go_back().
+        L3: Hard Reset / Fresh Context - If still displaced or stuck, re-navigate directly to expected URL.
+        """
+        # L1: Soft dismiss modal/overlay/popovers
+        try:
+            page.keyboard.press("Escape")
+            page.evaluate("""() => {
+                const dismissibles = document.querySelectorAll('.toast, .alert-dismissible, .modal-backdrop, [aria-modal="true"] .close, button.close, [aria-label="Close"]');
+                dismissibles.forEach(el => {
+                    try { el.click(); } catch(e) {}
+                    try { el.style.display = 'none'; } catch(e) {}
+                });
+            }""")
+        except Exception:
+            pass
+
+        # L2 & L3: Check URL displacement
+        try:
+            current_url = page.url
+            if expected_url and current_url.rstrip("/") != expected_url.rstrip("/"):
+                # If drifted out of scope or navigated away from current focus page
+                logger.info(f"[Backtrack L2] Page drifted from {expected_url} to {current_url}. Invoking go_back()...")
+                try:
+                    page.go_back(wait_until="domcontentloaded", timeout=4000)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
+                # If still displaced after go_back, perform L3 Hard Reset
+                if page.url.rstrip("/") != expected_url.rstrip("/"):
+                    logger.info(f"[Backtrack L3] Hard resetting to target page URL: {expected_url}")
+                    page.goto(expected_url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+                    page.wait_for_timeout(500)
+        except Exception as e:
+            logger.debug(f"Backtracking guardian recovered with error: {e}")
+
+    def _run_site_wide_traversal(self, page: Page):
+        """
+        Whole-Site Autonomous Traversal:
+        BFS-based crawl queue spanning all reachable pages within max_depth and max_pages.
+        Extracts links, maintains site topology graph, and executes interactive element testing on each page.
+        """
+        from collections import deque
+        norm_start = self._normalize_url(self.config.target_url, self.config.target_url) or self.config.target_url
+        queue = deque([(norm_start, 0)])  # (url, depth)
+        self.visited_urls.add(norm_start)
+
+        pages_inspected = 0
+        logger.info(f"[Site Traversal] Starting whole-site BFS traversal. Max Pages={self.config.max_pages}, Max Depth={self.config.max_depth}")
+
+        while queue and pages_inspected < self.config.max_pages:
+            current_url, depth = queue.popleft()
+
+            # L2 Path Archetyping check:
+            # Prevents endless pagination / duplicate item traps by capping pages per pattern
+            archetype = self._get_url_archetype(current_url)
+            current_count = self.url_pattern_counts.get(archetype, 0)
+            if current_count >= self.config.max_pages_per_pattern:
+                logger.info(f"[Path Archetyping] Skipping {current_url} - pattern '{archetype}' reached limit ({current_count}/{self.config.max_pages_per_pattern})")
+                continue
+            self.url_pattern_counts[archetype] = current_count + 1
+
+            pages_inspected += 1
+            logger.info(f"[Site Traversal] [{pages_inspected}/{self.config.max_pages}] Inspecting page (depth={depth}): {current_url} [Pattern: {archetype}]")
+
+            # Navigate to target page (if not already there)
+            try:
+                if page.url.rstrip("/") != current_url.rstrip("/"):
+                    page.goto(current_url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+                    page.wait_for_timeout(1000)
+                
+                title = page.title()
+                self.discovered_pages.append({
+                    "url": current_url,
+                    "title": title,
+                    "depth": depth,
+                    "archetype": archetype,
+                    "status": "LOADED"
+                })
+            except Exception as e:
+                logger.error(f"[Site Traversal] Failed to navigate to {current_url}: {e}")
+                self.errors_found.append({
+                    "action": f"navigate_site_page: {current_url}",
+                    "detected_texts": [str(e)],
+                    "error_type": "network_error",
+                    "jev_confidence": 1.0,
+                    "severity_score": 1.0,
+                    "screenshot": "",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+                continue
+
+            # Check for page load errors
+            p_err = self.check_for_page_errors(page, f"page_load: {current_url}")
+            if p_err:
+                self.errors_found.append(p_err)
+
+            # Discover outgoing links for the crawl graph (if depth allows)
+            if depth < self.config.max_depth:
+                extracted_links = self._extract_page_links(page, current_url)
+                logger.info(f"[Site Traversal] Found {len(extracted_links)} in-scope links on {current_url}")
+
+                for link in extracted_links:
+                    self.site_topology.append({
+                        "source": current_url,
+                        "target": link,
+                        "depth": depth + 1
+                    })
+                    if link not in self.visited_urls:
+                        self.visited_urls.add(link)
+                        queue.append((link, depth + 1))
+
+            # Run interactive exploration on this specific page
+            if self.config.max_actions_per_page > 0:
+                self._run_single_page_traversal(page, max_actions=self.config.max_actions_per_page, page_tag=current_url)
+
+        logger.info(f"[Site Traversal] Completed. Inspected {pages_inspected} pages, discovered {len(self.visited_urls)} unique URLs, {len(self.site_topology)} navigation edges.")
+
+    def _save_and_report(self) -> Dict[str, Any]:
+        duration = round(self.end_timestamp - self.start_timestamp, 2)
+        
+        # Calculate coverage metrics
+        total_discovered_elements = len(self.covered_candidate_signatures) + len(self.skipped_duplicates)
+        interacted_count = len(self.covered_candidate_signatures)
+        element_coverage_rate = round(interacted_count / total_discovered_elements, 4) if total_discovered_elements > 0 else 1.0
+
+        summary = {
+            "target_url": self.config.target_url,
+            "crawl_mode": self.config.crawl_mode,
+            "duration_seconds": duration,
+            "total_pages_discovered": len(self.discovered_pages),
+            "total_urls_visited": len(self.visited_urls),
+            "total_actions_executed": len(self.executed_actions),
+            "total_duplicates_skipped": len(self.skipped_duplicates),
+            "total_errors_detected": len(self.errors_found),
+            "coverage_metrics": {
+                "unique_interactive_signatures": interacted_count,
+                "total_candidate_elements_encountered": total_discovered_elements,
+                "element_coverage_rate": element_coverage_rate,
+                "pages_discovered_count": len(self.discovered_pages),
+                "url_archetypes_count": len(self.url_pattern_counts)
+            },
+            "status": "FAILED" if self.errors_found else "PASSED",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        report = {
+            "summary": summary,
+            "site_topology": self.site_topology,
+            "discovered_pages": self.discovered_pages,
+            "url_archetype_distribution": self.url_pattern_counts,
+            "errors_detected": self.errors_found,
+            "executed_actions": self.executed_actions,
+            "skipped_duplicates": self.skipped_duplicates
+        }
+
+        # 1. Save JSON Report
+        if self.config.report_json_path:
+            with open(self.config.report_json_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved inspection JSON report to {self.config.report_json_path}")
+
+        # Dispatch on_finish extension hook
+        self.extensions.dispatch_finish(report)
+
+        # 2. Generate HTML Report
+        try:
+            from ..reporting.generate_report import generate_html_report
+            import glob
+            json_files = glob.glob("report_*.json") + [self.config.report_json_path]
+            generate_html_report(list(set(json_files)), self.config.report_html_path)
+            logger.info(f"Updated HTML report at {self.config.report_html_path}")
+        except Exception as e:
+            logger.warning(f"Failed to compile HTML report: {e}")
+
+        # 3. Trigger Alert if configured and errors detected
+        if self.config.alert.enabled and self.errors_found:
+            self.alert_manager.send_alert(
+                title=f"线上巡检异常发现 ({self.config.target_url})",
+                summary=summary,
+                errors=self.errors_found
+            )
+
+        # 4. Generate Prometheus Metrics file
+        self._export_prometheus_metrics(summary)
+
+        logger.info("="*50)
+        logger.info(f"Inspection Run Summary: Status={summary['status']}, Actions={summary['total_actions_executed']}, Errors={summary['total_errors_detected']}, Time={duration}s")
+        logger.info("="*50)
+
+        return report
+
+    def _export_prometheus_metrics(self, summary: Dict[str, Any], filepath: str = "inspection_metrics.prom"):
+        """Export Prometheus metrics for node_exporter or Pushgateway ingestion."""
+        lines = [
+            "# HELP web_inspection_status Inspection result status (1 = passed, 0 = failed)",
+            "# TYPE web_inspection_status gauge",
+            f'web_inspection_status{{target="{summary["target_url"]}"}} {1 if summary["status"] == "PASSED" else 0}',
+            "# HELP web_inspection_errors_total Total errors detected during inspection",
+            "# TYPE web_inspection_errors_total counter",
+            f'web_inspection_errors_total{{target="{summary["target_url"]}"}} {summary["total_errors_detected"]}',
+            "# HELP web_inspection_actions_total Total actions executed during inspection",
+            "# TYPE web_inspection_actions_total counter",
+            f'web_inspection_actions_total{{target="{summary["target_url"]}"}} {summary["total_actions_executed"]}',
+            "# HELP web_inspection_element_coverage Element coverage ratio (0.0 to 1.0)",
+            "# TYPE web_inspection_element_coverage gauge",
+            f'web_inspection_element_coverage{{target="{summary["target_url"]}"}} {summary.get("coverage_metrics", {}).get("element_coverage_rate", 1.0)}',
+            "# HELP web_inspection_pages_total Number of distinct pages explored",
+            "# TYPE web_inspection_pages_total gauge",
+            f'web_inspection_pages_total{{target="{summary["target_url"]}"}} {summary.get("total_pages_discovered", 1)}',
+            "# HELP web_inspection_duration_seconds Inspection run duration in seconds",
+            "# TYPE web_inspection_duration_seconds gauge",
+            f'web_inspection_duration_seconds{{target="{summary["target_url"]}"}} {summary["duration_seconds"]}\n'
+        ]
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            logger.warning(f"Failed to write prometheus metrics: {e}")
+
+# Backward compatibility alias
+WebCrawler = WebInspectionCrawler

@@ -25,29 +25,41 @@
 ## 🚀 核心架构与创新突破
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                      Jev-Inspector 生产级巡检体系                       │
-├────────────────────────────────────────────────────────────────────────┤
-│  1. 调度编排层 (scheduler.py / run_inspection.py)                      │
-│     • ThreadPool 多站点高并发隔离调度                                   │
-│     • 指数退避重试 (Exponential Backoff) + 连续失败智能熔断             │
-│     • SQLite 历史结果自动持久化 (ResultStore)                           │
-│     • HTTP 探针服务 (/health 存活检测, /metrics Prometheus指标)          │
-│                                                                        │
-│  2. 执行与决策层 (crawler.py / flow_engine.py / jev_client.py)          │
-│     • 双模驱动：预设确定性业务链 (FlowExecutor) + AI 广度探索 (Crawler)  │
-│     • DOM 结构指纹去重 (Flex/Grid/Card/Table 行模式归一化)               │
-│     • 破坏性动作拦截器 (Destructive Action Guard: 防误触登出/删库/注销)   │
-│     • Jev AI 决策原语 (noul 判定 + choice 归类 + score 严重度定级)       │
-│                                                                        │
-│  3. 可观测与告警层 (alert_manager.py / generate_report.py)             │
-│     • 多通道富文本告警：飞书卡片 / 钉钉 Markdown / 企业微信 / Slack    │
-│     • Prometheus 指标实时生成 (.prom & /metrics)                        │
-│     • 交互式 HTML 巡检可视化大屏 + 故障现场截图留存                     │
-└────────────────────────────────────────────────────────────────────────┘
+jev_inspector/                      # 现代化分层架构核心包
+├── core/                           # 配置与环境上下文驱动
+│   ├── config.py                   # InspectionConfig, AuthConfig, AlertConfig
+│   └── __init__.py
+├── engine/                         # 双模执行核心
+│   ├── crawler.py                  # WebInspectionCrawler, BFS整站拓扑探索, 四层去重, 覆盖率统计
+│   ├── flow_engine.py              # FlowExecutor, 显式多页面切换, SLA校验, 断言引擎
+│   └── __init__.py
+├── decision/                       # AI 与启发式研判决策
+│   ├── jev_client.py               # TypeSafe Jev System One Client (noul/choice/score)
+│   └── __init__.py
+├── alert/                          # 运维与企业协同告警
+│   ├── alert_manager.py            # 飞书/钉钉/企业微信/Slack/Webhook
+│   └── __init__.py
+├── scheduler/                      # 高可用并发调度与持久化
+│   ├── scheduler.py                # InspectionScheduler, ResultStore, HealthCheckServer
+│   └── __init__.py
+├── reporting/                      # 报告与可视化大屏
+│   ├── generate_report.py          # HTML Dashboard 生成器
+│   └── __init__.py
+└── extensions/                     # 🔌 插件扩展机制 (生命周期钩子)
+    ├── base.py                     # BaseExtension, ExtensionManager (留出扩展口子)
+    └── __init__.py
 ```
 
-### 1. 零脚本 AI 主动遍历、整站拓扑图与结构去重
+### 1. 现代化分层包与插件扩展机制 (Plugin & Extensions Architecture)
+- **开箱即用的分层包结构**：全核心逻辑统一收敛至 `jev_inspector` 模块内，对外提供向后兼容的轻量导入方式（`from jev_inspector import WebInspectionCrawler, InspectionConfig`）；
+- **生命周期插件钩子 (Lifecycle Hooks)**：通过 `BaseExtension` 开放整套可扩展机制：
+  - `on_page_start` / `on_page_loaded`：页面导航与加载切面；
+  - `on_before_action`：动作执行前置守卫（可按条件拦截/放行点击）；
+  - `on_after_action`：动作执行后置监听与时延打点；
+  - `on_error_detected`：异常即时拦截转发（支持快速对接 Sentry、内部工单系统）；
+  - `on_finish`：报告生成前的自定义后处理。
+
+### 2. 零脚本 AI 主动遍历、整站拓扑图与结构去重
 无需预先录制操作。引擎基于真实 Chromium 实时解析 DOM 树，提取所有按钮、表单、输入框、下拉菜单等交互元素。
 - **整站拓扑遍历（Whole-Site BFS Traversal）**：支持从入口 URL 开始，自动发现整站内部超链接，利用广度优先搜索（BFS）层层下钻探索整个站点所有可达页面，并自动生成整站拓扑依赖图（Site Topology Graph）。
 - **四层递进式去重机制**：
