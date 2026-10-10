@@ -835,10 +835,18 @@ class WebInspectionCrawler:
     def _save_and_report(self) -> Dict[str, Any]:
         duration = round(self.end_timestamp - self.start_timestamp, 2)
         
-        # Calculate coverage metrics
-        total_discovered_elements = len(self.covered_candidate_signatures) + len(self.skipped_duplicates)
-        interacted_count = len(self.covered_candidate_signatures)
-        element_coverage_rate = round(interacted_count / total_discovered_elements, 4) if total_discovered_elements > 0 else 1.0
+        # Calculate coverage metrics:
+        # 1. Functional Archetype Coverage: Percentage of unique element types/signatures successfully tested
+        # 2. Raw Volume Coverage: Interacted items vs total DOM candidates encountered across all pages
+        interacted_archetypes_count = len(self.covered_candidate_signatures)
+        all_unique_signatures = self.covered_candidate_signatures.union(
+            set(item.get("signature", "") for item in self.skipped_duplicates if item.get("signature"))
+        )
+        total_unique_archetypes = len(all_unique_signatures) if all_unique_signatures else interacted_archetypes_count
+        functional_coverage_rate = round(interacted_archetypes_count / total_unique_archetypes, 4) if total_unique_archetypes > 0 else 1.0
+
+        total_dom_candidates_encountered = interacted_archetypes_count + len(self.skipped_duplicates)
+        raw_sampling_rate = round(interacted_archetypes_count / total_dom_candidates_encountered, 4) if total_dom_candidates_encountered > 0 else 1.0
 
         summary = {
             "target_url": self.config.target_url,
@@ -850,9 +858,13 @@ class WebInspectionCrawler:
             "total_duplicates_skipped": len(self.skipped_duplicates),
             "total_errors_detected": len(self.errors_found),
             "coverage_metrics": {
-                "unique_interactive_signatures": interacted_count,
-                "total_candidate_elements_encountered": total_discovered_elements,
-                "element_coverage_rate": element_coverage_rate,
+                "element_coverage_rate": functional_coverage_rate,
+                "functional_archetype_coverage_rate": functional_coverage_rate,
+                "unique_interactive_signatures": interacted_archetypes_count,
+                "unique_interactive_signatures_tested": interacted_archetypes_count,
+                "total_unique_archetypes_discovered": total_unique_archetypes,
+                "raw_sampling_rate": raw_sampling_rate,
+                "total_raw_elements_encountered": total_dom_candidates_encountered,
                 "pages_discovered_count": len(self.discovered_pages),
                 "url_archetypes_count": len(self.url_pattern_counts)
             },
